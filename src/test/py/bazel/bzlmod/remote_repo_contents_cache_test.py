@@ -933,6 +933,50 @@ class RemoteRepoContentsCacheTest(test_base.TestBase):
   def testUseRepoFileInBuildRule_actionDoesNotUseCache(self):
     self.do_testUseRepoFileInBuildRule_actionDoesNotUseCache()
 
+  def testUseRepoFileInBuildRule_evictedRepoFileDoesNotCrash(self):
+    self.ScratchFile(
+        'MODULE.bazel',
+        [
+            'repo = use_repo_rule("//:repo.bzl", "repo")',
+            'repo(name = "my_repo")',
+        ],
+    )
+    self.ScratchFile('BUILD.bazel')
+    self.ScratchFile(
+        'repo.bzl',
+        [
+            'def _repo_impl(rctx):',
+            '  rctx.file("BUILD", "exports_files([\'data.txt\'])")',
+            '  rctx.file("data.txt", "hello")',
+            '  return rctx.repo_metadata(reproducible=True)',
+            'repo = repository_rule(_repo_impl)',
+        ],
+    )
+    self.ScratchFile(
+        'main/BUILD.bazel',
+        [
+            'genrule(',
+            '  name = "use_data",',
+            '  srcs = ["@my_repo//:data.txt"],',
+            '  outs = ["out.txt"],',
+            '  cmd = "cat $< > $@",',
+            '  tags = ["no-cache"],',
+            ')',
+        ],
+    )
+
+    self.RunBazel(['build', '//main:use_data', '--rewind_lost_inputs'])
+
+    self.RunBazel(['clean', '--expunge'])
+    self.RunBazel(['build', '--nobuild', '//main:use_data'])
+    self.DeleteCasEntry(b'hello')
+
+    exit_code, _, stderr = self.RunBazel(
+        ['build', '//main:use_data', '--rewind_lost_inputs'],
+        allow_failure=True,
+    )
+    self.assertNotEqual(exit_code, 37, '\n'.join(stderr))
+
   def testUseRepoFileInBuildRule_actionDoesNotUseCache_withExplicitSandboxBase(
       self,
   ):

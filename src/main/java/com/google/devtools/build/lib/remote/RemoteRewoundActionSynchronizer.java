@@ -278,7 +278,14 @@ public final class RemoteRewoundActionSynchronizer implements RewoundActionSynch
       throws InterruptedException {
     try (SilentCloseable c =
         Profiler.instance().profile(ProfilerTask.ACTION_LOCK, "action.enterActionExecution")) {
-      return lockArtifactsForConsumption(action.getInputs().toList(), metadataProvider);
+      // Inputs discovered during execution are not in getInputs() yet.
+      Iterable<Artifact> inputs =
+          action.discoversInputs()
+              ? Iterables.concat(
+                  action.getOriginalInputs().toList(),
+                  action.getSchedulingDependencies().toList())
+              : action.getInputs().toList();
+      return lockArtifactsForConsumption(inputs, metadataProvider);
     }
   }
 

@@ -3288,11 +3288,6 @@ function test_rewound_tree_producer_races_consumer_prefetch() {
   # the producer of their header tree, as the tree is not in getInputs() until after execution.
   # Rewinding that producer may thus delete the tree while such an action prefetches into it.
   #
-  # Action TREE produces the tree with headers H1 and H2 as well as the files LOST and LATE.
-  # Genrule USE consumes LOST and LATE. Genrule GEN produces file GEN. Genrule SRC consumes GEN
-  # and produces the source compiled by COMPILE, which includes H1 and H2. USE also consumes that
-  # source.
-  #
   # The final build, on a fresh server with LOST and GEN missing from the CAS:
   # 1. SRC fails to fetch GEN and rewinds it. The synchronizer switches from its coarse lock to
   #    per-action locks.

@@ -254,8 +254,7 @@ public abstract class RemoteWorkerOptions extends OptionsBase {
       effectTags = {OptionEffectTag.UNKNOWN},
       help =
           "A file with lines of the form \"<hash> <millis>\", delaying reads of the blob with the"
-              + " given hash by the given number of milliseconds. It is reread on every read, so"
-              + " it may be written after the worker has started. This is useful for testing only.")
+              + " given hash by the given number of milliseconds. Reread on every read.")
   public abstract PathFragment getReadDelaysFile();
 
   @Option(

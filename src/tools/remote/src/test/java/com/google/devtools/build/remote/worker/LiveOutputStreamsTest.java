@@ -73,7 +73,8 @@ public final class LiveOutputStreamsTest {
         InProcessServerBuilder.forName(serverName)
             .addService(
                 ServerInterceptors.intercept(
-                    new ByteStreamServer(cache, workPath, digestUtil, liveOutputStreams),
+                    new ByteStreamServer(
+                        cache, workPath, digestUtil, liveOutputStreams, /* readDelaysFile= */ null),
                     // Like the real worker, which requires request metadata on every call.
                     new TracingMetadataUtils.ServerHeadersInterceptor()))
             .build()

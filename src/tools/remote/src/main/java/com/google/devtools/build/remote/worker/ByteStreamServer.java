@@ -15,6 +15,7 @@
 package com.google.devtools.build.remote.worker;
 
 import static com.google.devtools.build.lib.remote.util.Futures.getFromFuture;
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 import build.bazel.remote.execution.v2.Digest;
 import build.bazel.remote.execution.v2.RequestMetadata;
@@ -58,6 +59,7 @@ final class ByteStreamServer extends ByteStreamImplBase {
   private final Path workPath;
   private final DigestUtil digestUtil;
   @Nullable private final LiveOutputStreams liveOutputStreams;
+  @Nullable private final Path readDelaysFile;
 
   @Nullable
   static Digest parseDigestFromResourceName(String resourceName) {
@@ -78,11 +80,26 @@ final class ByteStreamServer extends ByteStreamImplBase {
       OnDiskBlobStoreCache cache,
       Path workPath,
       DigestUtil digestUtil,
-      @Nullable LiveOutputStreams liveOutputStreams) {
+      @Nullable LiveOutputStreams liveOutputStreams,
+      @Nullable Path readDelaysFile) {
     this.cache = cache;
     this.workPath = workPath;
     this.digestUtil = digestUtil;
     this.liveOutputStreams = liveOutputStreams;
+    this.readDelaysFile = readDelaysFile;
+  }
+
+  private long readDelayMillis(Digest digest) throws IOException {
+    if (readDelaysFile == null || !readDelaysFile.exists()) {
+      return 0;
+    }
+    for (String line : FileSystemUtils.readLines(readDelaysFile, UTF_8)) {
+      String[] fields = line.trim().split("\\s+");
+      if (fields.length == 2 && fields[0].equals(digest.getHash())) {
+        return Long.parseLong(fields[1]);
+      }
+    }
+    return 0;
   }
 
   @Override
@@ -131,6 +148,7 @@ final class ByteStreamServer extends ByteStreamImplBase {
           readLimit > 0
               ? (int) Math.min(bytes.length - readOffset, readLimit)
               : bytes.length - offset;
+      Thread.sleep(readDelayMillis(digest));
       try (Chunker c =
           Chunker.builder()
               .setInput(length, () -> new ByteArrayInputStream(bytes, offset, length))

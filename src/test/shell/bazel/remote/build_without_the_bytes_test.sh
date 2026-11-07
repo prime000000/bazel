@@ -3283,4 +3283,131 @@ EOF
   done
 }
 
+function test_rewound_tree_producer_races_consumer_prefetch() {
+  # Compile actions that discover inputs hold no RemoteRewoundActionSynchronizer read lock on
+  # the producer of their header tree, as the tree is not in getInputs() until after execution.
+  # Rewinding that producer may thus delete the tree while such an action prefetches into it.
+  #
+  # Action TREE produces the tree with headers H1 and H2 as well as the files LOST and LATE.
+  # Genrule USE consumes LOST and LATE. Genrule GEN produces file GEN. Genrule SRC consumes GEN
+  # and produces the source compiled by COMPILE, which includes H1 and H2. USE also consumes that
+  # source.
+  #
+  # The final build, on a fresh server with LOST and GEN missing from the CAS:
+  # 1. SRC fails to fetch GEN and rewinds it. The synchronizer switches from its coarse lock to
+  #    per-action locks.
+  # 2. SRC runs, then COMPILE starts prefetching H1 and H2, and USE starts prefetching LOST and
+  #    LATE. H1 arrives at once and creates the tree directory.
+  # 3. After 1s, LATE arrives and USE fails to fetch LOST, rewinding TREE. The prepare() of TREE
+  #    deletes the tree directory and the sleep of TREE keeps the directory absent.
+  # 4. After 3s, H2 arrives and the prefetcher fails to set permissions on the tree directory.
+  stop_worker
+  local read_delays_file="${TEST_TMPDIR}/read_delays"
+  start_worker --read_delays_file="${read_delays_file}"
+
+  add_rules_cc MODULE.bazel
+  mkdir pkg
+  cat > pkg/defs.bzl <<'EOF'
+def _tree_impl(ctx):
+    tree = ctx.actions.declare_directory("tree")
+    lost = ctx.actions.declare_file("lost")
+    late = ctx.actions.declare_file("late")
+    ctx.actions.run_shell(
+        outputs = [tree, lost, late],
+        arguments = [tree.path, lost.path, late.path],
+        command = """
+        sleep 5
+        mkdir "$1/sub"
+        echo "// h1" > "$1/sub/h1.h"
+        echo "// h2" > "$1/sub/h2.h"
+        echo lost > "$2"
+        echo late > "$3"
+        """,
+    )
+    return [
+        DefaultInfo(files = depset([tree])),
+        OutputGroupInfo(files = depset([lost, late])),
+    ]
+
+tree = rule(_tree_impl)
+EOF
+  cat > pkg/BUILD <<'EOF'
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("//pkg:defs.bzl", "tree")
+
+tree(name = "tree")
+
+filegroup(
+    name = "tree_files",
+    srcs = [":tree"],
+    output_group = "files",
+)
+
+genrule(
+    name = "use",
+    srcs = [
+        ":tree_files",
+        "src.cc",
+    ],
+    outs = ["use"],
+    cmd = "cat $(SRCS) > $@",
+)
+
+genrule(
+    name = "gen",
+    outs = ["gen"],
+    cmd = "echo gen > $@",
+)
+
+genrule(
+    name = "src",
+    srcs = [
+        ":gen",
+        "stamp.txt",
+    ],
+    outs = ["src.cc"],
+    cmd = "(echo '#include \"pkg/tree/sub/h1.h\"'; echo '#include \"pkg/tree/sub/h2.h\"'; echo 'int f() { return '$$(cat $(location stamp.txt))'; }') > $@",
+)
+
+cc_library(
+    name = "compile",
+    srcs = ["src.cc"],
+    hdrs = [":tree"],
+)
+EOF
+  echo 0 > pkg/stamp.txt
+
+  local flags=(
+    --remote_cache=grpc://localhost:${worker_port}
+    --remote_download_minimal
+    --rewind_lost_inputs
+    --experimental_remote_cache_eviction_retries=0
+  )
+
+  bazel build "${flags[@]}" //pkg:use //pkg:compile &> $TEST_log || fail "initial build failed"
+  local h2_hash=$(sha256sum bazel-bin/pkg/tree/sub/h2.h | cut -d' ' -f1)
+  local lost_hash=$(sha256sum bazel-bin/pkg/lost | cut -d' ' -f1)
+  local late_hash=$(sha256sum bazel-bin/pkg/late | cut -d' ' -f1)
+  local gen_hash=$(sha256sum bazel-bin/pkg/gen | cut -d' ' -f1)
+
+  bazel clean &> $TEST_log || fail "clean failed"
+  bazel build "${flags[@]}" //pkg:use //pkg:compile &> $TEST_log || fail "seed build failed"
+  if [[ -e bazel-bin/pkg/tree/sub/h1.h ]]; then
+    fail "tree was downloaded during seed build"
+  fi
+
+  local hash
+  for hash in "${lost_hash}" "${gen_hash}"; do
+    remote_cas_file_exist "${hash}" || fail "blob ${hash} missing from remote CAS"
+    rm "${cas_path}/cas/${hash:0:2}/${hash}"
+  done
+  echo 1 > pkg/stamp.txt
+  bazel shutdown &> $TEST_log || fail "shutdown failed"
+
+  echo "${h2_hash} 3000" > "${read_delays_file}"
+  echo "${late_hash} 1000" >> "${read_delays_file}"
+
+  bazel build "${flags[@]}" //pkg:use //pkg:compile &> $TEST_log || fail "build failed"
+}
+
 run_suite "Build without the Bytes tests"

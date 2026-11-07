@@ -247,7 +247,15 @@ public final class RemoteWorker {
     }
     LiveOutputStreams liveOutputStreams =
         workerOptions.getLiveOutputStreams() ? new LiveOutputStreams() : null;
-    this.bsServer = new ByteStreamServer(cache, workPath, digestUtil, liveOutputStreams);
+    this.bsServer =
+        new ByteStreamServer(
+            cache,
+            workPath,
+            digestUtil,
+            liveOutputStreams,
+            workerOptions.getReadDelaysFile() == null
+                ? null
+                : fs.getPath(workerOptions.getReadDelaysFile()));
     this.casServer = new CasServer(cache);
 
     if (workerOptions.getWorkPath() != null) {

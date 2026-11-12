@@ -18,6 +18,9 @@ import static com.google.common.truth.Truth.assertThat;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.devtools.build.lib.actions.util.ActionsTestUtil;
+import com.google.devtools.build.lib.collect.nestedset.NestedSet;
+import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
+import com.google.devtools.build.lib.collect.nestedset.Order;
 import com.google.devtools.build.lib.exec.util.SpawnBuilder;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -85,5 +88,49 @@ public final class SpawnTest {
 
     assertThat(spawn.getLocalResources()).isEqualTo(DECLARED_RESOURCES);
     assertThat(spawn.getExecutionInfo()).containsKey("resources:cpu:4");
+  }
+
+  @Test
+  public void prunableInputs_defaultEmptyAndExposedBySimpleSpawn() {
+    ActionInput mandatory = ActionInputHelper.fromPath("src");
+    ActionInput a = ActionInputHelper.fromPath("a");
+    NestedSet<ActionInput> prunable = NestedSetBuilder.create(Order.STABLE_ORDER, a);
+    NestedSet<ActionInput> inputs =
+        NestedSetBuilder.<ActionInput>stableOrder().add(mandatory).addTransitive(prunable).build();
+
+    assertThat(baseSpawn(ResourceSetOrBuilder.ignoringOverrides(DECLARED_RESOURCES))
+            .getPrunableInputs()
+            .isEmpty())
+        .isTrue();
+
+    SimpleSpawn plain =
+        new SimpleSpawn(
+            new ActionsTestUtil.NullAction(),
+            ImmutableList.of("/bin/true"),
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            inputs,
+            NestedSetBuilder.emptySet(Order.STABLE_ORDER),
+            ImmutableList.of(),
+            /* mandatoryOutputs= */ null,
+            ResourceSet.ZERO,
+            PathMapper.NOOP);
+    assertThat(plain.getPrunableInputs().isEmpty()).isTrue();
+
+    SimpleSpawn spawn =
+        new SimpleSpawn(
+            new ActionsTestUtil.NullAction(),
+            ImmutableList.of("/bin/true"),
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            inputs,
+            NestedSetBuilder.emptySet(Order.STABLE_ORDER),
+            ImmutableList.of(),
+            /* mandatoryOutputs= */ null,
+            ResourceSet.ZERO,
+            PathMapper.NOOP,
+            prunable);
+    assertThat(spawn.getPrunableInputs().toList()).containsExactly(a);
+    assertThat(spawn.getInputFiles().toList()).containsExactly(mandatory, a);
   }
 }

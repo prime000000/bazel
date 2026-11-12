@@ -974,6 +974,28 @@ public class RemoteExecutionService {
 
   private void maybeUploadPrunedOutputs(RemoteAction action, SpawnResult spawnResult, boolean force)
       throws IOException, ExecException, InterruptedException {
+    recordPrunedInputs(action, spawnResult, /* executedResult= */ null, force);
+  }
+
+  public void recordPrunedInputsAfterRemoteExecution(
+      RemoteAction action, RemoteActionResult result, SpawnResult spawnResult)
+      throws InterruptedException {
+    if (!action.getRemoteActionExecutionContext().getWriteCachePolicy().allowAnyCache()) {
+      return;
+    }
+    try {
+      recordPrunedInputs(action, spawnResult, result.actionResult, /* force= */ false);
+    } catch (IOException | ExecException e) {
+      reportUploadError(e);
+    }
+  }
+
+  private void recordPrunedInputs(
+      RemoteAction action,
+      SpawnResult spawnResult,
+      @Nullable ActionResult executedResult,
+      boolean force)
+      throws IOException, ExecException, InterruptedException {
     Spawn spawn = action.getSpawn();
     if (!remoteOptions.remoteCachePrunedInputs
         || spawn.getPrunableInputs().isEmpty()
@@ -995,10 +1017,24 @@ public class RemoteExecutionService {
     }
 
     RemoteAction prunedAction = buildPrunedAction(action, used);
-    UploadManifest prunedUpload = buildUploadManifest(prunedAction, spawnResult);
-    var unused =
-        prunedUpload.upload(
-            prunedAction.getRemoteActionExecutionContext(), combinedCache, reporter, force);
+    if (executedResult == null) {
+      UploadManifest prunedUpload = buildUploadManifest(prunedAction, spawnResult);
+      var unused =
+          prunedUpload.upload(
+              prunedAction.getRemoteActionExecutionContext(), combinedCache, reporter, force);
+    } else {
+      RemoteActionExecutionContext context = prunedAction.getRemoteActionExecutionContext();
+      ByteString actionBytes = prunedAction.getAction().toByteString();
+      ByteString commandBytes = prunedAction.getCommand().toByteString();
+      waitForBulkTransfer(
+          ImmutableList.of(
+              combinedCache.uploadBlob(
+                  context, prunedAction.getActionKey().digest(), (Blob) actionBytes::newInput, force),
+              combinedCache.uploadBlob(
+                  context, prunedAction.getCommandHash(), (Blob) commandBytes::newInput, force)));
+      getFromFuture(
+          combinedCache.uploadActionResult(context, prunedAction.getActionKey(), executedResult));
+    }
 
     RemoteAction manifestAction = buildManifestAction(action, prunableByPath.keySet());
     Digest prunedKey = prunedAction.getActionKey().digest();

@@ -50,6 +50,7 @@ import com.google.devtools.build.lib.actions.InputMetadataProvider;
 import com.google.devtools.build.lib.actions.ParamFileInfo;
 import com.google.devtools.build.lib.actions.ParameterFile.ParameterFileType;
 import com.google.devtools.build.lib.actions.PathMapper;
+import com.google.devtools.build.lib.actions.PrunesSpawnInputs;
 import com.google.devtools.build.lib.actions.ResourceSet;
 import com.google.devtools.build.lib.actions.SimpleSpawn;
 import com.google.devtools.build.lib.actions.Spawn;
@@ -102,6 +103,7 @@ import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -117,7 +119,8 @@ import net.starlark.java.eval.StarlarkList;
 /** Action that represents some kind of C++ compilation step. */
 @AutoCodec
 @ThreadCompatible
-public class CppCompileAction extends AbstractAction implements IncludeScannable, CommandAction {
+public class CppCompileAction extends AbstractAction
+    implements IncludeScannable, CommandAction, PrunesSpawnInputs {
 
   private static final UUID GUID = UUID.fromString("97493805-894f-493a-be66-9a698f45c31d");
 
@@ -1719,13 +1722,20 @@ public class CppCompileAction extends AbstractAction implements IncludeScannable
     NestedSetBuilder<ActionInput> inputsBuilder =
         NestedSetBuilder.<ActionInput>stableOrder().addTransitive(mandatorySpawnInputs);
 
-    if (discoversInputs()) {
-      inputsBuilder.addTransitive(getAdditionalInputs());
-    }
+    NestedSet<Artifact> additionalInputs =
+        discoversInputs() ? getAdditionalInputs() : NestedSetBuilder.emptySet(Order.STABLE_ORDER);
+    inputsBuilder.addTransitive(additionalInputs);
     if (paramFileActionInput != null) {
       inputsBuilder.add(paramFileActionInput);
     }
     NestedSet<ActionInput> inputs = inputsBuilder.build();
+    boolean prunable =
+        getDotdFile() != null
+            && !shouldScanIncludes
+            && !shouldParseShowIncludes()
+            && (usedCpp20Modules == null || usedCpp20Modules.isEmpty());
+    NestedSet<Artifact> prunableInputs =
+        prunable ? additionalInputs : NestedSetBuilder.emptySet(Order.STABLE_ORDER);
 
     ImmutableMap.Builder<String, String> executionInfo =
         ImmutableMap.<String, String>builder().putAll(getExecutionInfo());
@@ -1782,7 +1792,8 @@ public class CppCompileAction extends AbstractAction implements IncludeScannable
           (os, inputsSize) ->
               estimateResourceConsumptionLocal(
                   enabledCppCompileResourcesEstimation(), getMnemonic(), os, inputsSize),
-          pathMapper);
+          pathMapper,
+          prunableInputs);
     } catch (CommandLineExpansionException e) {
       String message =
           String.format(
@@ -1791,6 +1802,51 @@ public class CppCompileAction extends AbstractAction implements IncludeScannable
       DetailedExitCode code = createDetailedExitCode(message, Code.COMMAND_GENERATION_FAILURE);
       throw new ActionExecutionException(message, this, /* catastrophe= */ false, code);
     }
+  }
+
+  @Override
+  @Nullable
+  public ImmutableSet<ActionInput> usedPrunableInputs(
+      Spawn spawn, SpawnResult result, Path execRoot) throws IOException {
+    Artifact dotd = getDotdFile();
+    if (dotd == null || spawn.getPrunableInputs().isEmpty()) {
+      return null;
+    }
+    DependencySet depSet = new DependencySet(execRoot);
+    ByteString inMemory = result.getInMemoryOutput(dotd);
+    if (inMemory != null) {
+      depSet.process(inMemory.toByteArray());
+    } else {
+      depSet.read(execRoot.getRelative(dotd.getExecPath()));
+    }
+    PathMapper pathMapper = spawn.getPathMapper();
+    Map<PathFragment, ActionInput> files = new HashMap<>();
+    Map<PathFragment, ActionInput> trees = new HashMap<>();
+    for (ActionInput input : spawn.getPrunableInputs().toList()) {
+      (input.isDirectory() ? trees : files).putIfAbsent(pathMapper.map(input.getExecPath()), input);
+    }
+    ImmutableSet.Builder<ActionInput> used = ImmutableSet.builder();
+    for (Path dependency : depSet.getDependencies()) {
+      if (!dependency.startsWith(execRoot)) {
+        continue;
+      }
+      PathFragment execPath = dependency.relativeTo(execRoot);
+      ActionInput file = files.get(execPath);
+      if (file != null) {
+        used.add(file);
+        continue;
+      }
+      for (PathFragment dir = execPath.getParentDirectory();
+          dir != null;
+          dir = dir.getParentDirectory()) {
+        ActionInput tree = trees.get(dir);
+        if (tree != null) {
+          used.add(tree);
+          break;
+        }
+      }
+    }
+    return used.build();
   }
 
   private NestedSet<Artifact> discoverInputsFromShowIncludesFilters(

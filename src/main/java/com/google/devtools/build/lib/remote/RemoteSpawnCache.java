@@ -34,6 +34,7 @@ import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.ProfilerTask;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
 import com.google.devtools.build.lib.remote.RemoteExecutionService.LocalExecution;
+import com.google.devtools.build.lib.remote.RemoteExecutionService.PrunedCacheHit;
 import com.google.devtools.build.lib.remote.RemoteExecutionService.RemoteActionResult;
 import com.google.devtools.build.lib.remote.common.BulkTransferException;
 import com.google.devtools.build.lib.remote.common.CacheNotFoundException;
@@ -141,33 +142,41 @@ final class RemoteSpawnCache implements SpawnCache {
         }
         try {
           RemoteActionResult result;
+          RemoteAction hitAction = action;
           try (SilentCloseable c =
               prof.profile(ProfilerTask.REMOTE_CACHE_CHECK, "check cache hit")) {
             result = remoteExecutionService.lookupCache(action);
+            if (result == null) {
+              PrunedCacheHit prunedHit = remoteExecutionService.lookupPrunedCache(action);
+              if (prunedHit != null) {
+                hitAction = prunedHit.prunedAction();
+                result = prunedHit.result();
+              }
+            }
           }
           // In case the remote cache returned a failed action (exit code != 0) or failed to create
           // a mandatory output, we treat it as a cache miss.
           if (result != null
               && result.getExitCode() == 0
-              && result.maybeGetMissingMandatoryOutput(action).isEmpty()) {
+              && result.maybeGetMissingMandatoryOutput(hitAction).isEmpty()) {
             if (thisExecution != null) {
               thisExecution.close();
             }
             Stopwatch fetchTime = Stopwatch.createStarted();
             InMemoryOutput inMemoryOutput;
             try (SilentCloseable c = prof.profile(REMOTE_DOWNLOAD, "download outputs")) {
-              inMemoryOutput = remoteExecutionService.downloadOutputs(action, result);
+              inMemoryOutput = remoteExecutionService.downloadOutputs(hitAction, result);
             }
             fetchTime.stop();
             totalTime.stop();
             spawnMetrics
                 .setFetchTime(fetchTime.elapsed())
                 .setTotalTime(totalTime.elapsed())
-                .setNetworkTime(action.getNetworkTime().getDuration());
+                .setNetworkTime(hitAction.getNetworkTime().getDuration());
             SpawnResult spawnResult =
                 createSpawnResult(
                     digestUtil,
-                    action.getActionKey(),
+                    hitAction.getActionKey(),
                     result.getExitCode(),
                     /* cacheHit= */ true,
                     result.cacheName(),

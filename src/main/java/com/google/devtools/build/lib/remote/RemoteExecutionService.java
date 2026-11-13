@@ -16,6 +16,7 @@ package com.google.devtools.build.lib.remote;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Preconditions.checkState;
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static com.google.common.util.concurrent.Futures.immediateFailedFuture;
 import static com.google.common.util.concurrent.Futures.immediateFuture;
@@ -32,6 +33,7 @@ import static com.google.devtools.build.lib.remote.util.Utils.shouldUploadLocalR
 import static com.google.devtools.build.lib.remote.util.Utils.waitForBulkTransfer;
 import static com.google.devtools.build.lib.util.StringEncoding.internalToUnicode;
 import static com.google.devtools.build.lib.util.StringEncoding.unicodeToInternal;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Collections.min;
 import static java.util.Comparator.comparing;
 
@@ -59,6 +61,7 @@ import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.ImmutableSortedMap;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Maps;
 import com.google.common.eventbus.Subscribe;
@@ -76,10 +79,15 @@ import com.google.devtools.build.lib.actions.EnvironmentalExecException;
 import com.google.devtools.build.lib.actions.ExecException;
 import com.google.devtools.build.lib.actions.ExecutionRequirements;
 import com.google.devtools.build.lib.actions.FileArtifactValue;
+import com.google.devtools.build.lib.actions.PathMapper;
+import com.google.devtools.build.lib.actions.PrunesSpawnInputs;
 import com.google.devtools.build.lib.actions.Spawn;
 import com.google.devtools.build.lib.actions.SpawnResult;
 import com.google.devtools.build.lib.actions.Spawns;
 import com.google.devtools.build.lib.actions.cache.VirtualActionInput;
+import com.google.devtools.build.lib.collect.nestedset.NestedSet;
+import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
+import com.google.devtools.build.lib.collect.nestedset.Order;
 import com.google.devtools.build.lib.analysis.platform.PlatformInfo;
 import com.google.devtools.build.lib.analysis.platform.PlatformUtils;
 import com.google.devtools.build.lib.authandtls.credentialhelper.CredentialHelperException;
@@ -100,6 +108,7 @@ import com.google.devtools.build.lib.remote.RemoteExecutionService.ActionResultM
 import com.google.devtools.build.lib.remote.RemoteExecutionService.ActionResultMetadata.SymlinkMetadata;
 import com.google.devtools.build.lib.remote.Scrubber.SpawnScrubber;
 import com.google.devtools.build.lib.remote.common.BulkTransferException;
+import com.google.devtools.build.lib.remote.common.CacheNotFoundException;
 import com.google.devtools.build.lib.remote.common.LostInputsEvent;
 import com.google.devtools.build.lib.remote.common.OperationObserver;
 import com.google.devtools.build.lib.remote.common.OutputDigestMismatchException;
@@ -107,9 +116,11 @@ import com.google.devtools.build.lib.remote.common.ProgressStatusListener;
 import com.google.devtools.build.lib.remote.common.RemoteActionExecutionContext;
 import com.google.devtools.build.lib.remote.common.RemoteActionExecutionContext.CachePolicy;
 import com.google.devtools.build.lib.remote.common.RemoteCacheClient.ActionKey;
+import com.google.devtools.build.lib.remote.common.RemoteCacheClient.Blob;
 import com.google.devtools.build.lib.remote.common.RemoteExecutionCapabilitiesException;
 import com.google.devtools.build.lib.remote.common.RemoteExecutionClient;
 import com.google.devtools.build.lib.remote.common.RemotePathResolver;
+import com.google.devtools.build.lib.remote.prunedinputs.PrunedInputsManifest;
 import com.google.devtools.build.lib.remote.merkletree.MerkleTree;
 import com.google.devtools.build.lib.remote.merkletree.MerkleTreeComputer;
 import com.google.devtools.build.lib.remote.options.RemoteOptions;
@@ -138,6 +149,7 @@ import com.google.devtools.build.lib.worker.WorkerParser;
 import com.google.devtools.common.options.Options;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.ExtensionRegistry;
+import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
 import io.grpc.Status.Code;
 import java.io.FileNotFoundException;
@@ -374,9 +386,16 @@ public class RemoteExecutionService {
   }
 
   @Nullable
-  private static ByteString buildSalt(Spawn spawn, @Nullable SpawnScrubber spawnScrubber) {
+  private static ByteString buildSalt(
+      Spawn spawn,
+      @Nullable SpawnScrubber spawnScrubber,
+      @Nullable ByteString prunableInputPathsDigest) {
     CacheSalt.Builder saltBuilder =
         CacheSalt.newBuilder().setMayBeExecutedRemotely(Spawns.mayBeExecutedRemotely(spawn));
+
+    if (prunableInputPathsDigest != null) {
+      saltBuilder.setPrunableInputPathsDigest(prunableInputPathsDigest);
+    }
 
     String workspace =
         spawn.getExecutionInfo().get(ExecutionRequirements.DIFFERENTIATE_WORKSPACE_CACHE);
@@ -511,6 +530,21 @@ public class RemoteExecutionService {
   public RemoteAction buildRemoteAction(
       Spawn spawn, SpawnExecutionContext context, MerkleTreeComputer.BlobPolicy blobPolicy)
       throws IOException, ExecException, InterruptedException {
+    return buildRemoteAction(
+        spawn,
+        spawn.getInputFiles(),
+        /* prunableInputPathsDigest= */ null,
+        context,
+        blobPolicy);
+  }
+
+  public RemoteAction buildRemoteAction(
+      Spawn spawn,
+      NestedSet<? extends ActionInput> inputFiles,
+      @Nullable ByteString prunableInputPathsDigest,
+      SpawnExecutionContext context,
+      MerkleTreeComputer.BlobPolicy blobPolicy)
+      throws IOException, ExecException, InterruptedException {
     maybeAcquireRemoteActionBuildingSemaphore(ProfilerTask.REMOTE_SETUP);
     try {
       // Create a remote path resolver that is aware of the spawn's path mapper, which rewrites
@@ -525,6 +559,7 @@ public class RemoteExecutionService {
         merkleTree =
             merkleTreeComputer.buildForSpawn(
                 spawn,
+                inputFiles,
                 toolSignature != null ? toolSignature.toolInputs : ImmutableSet.of(),
                 scrubber,
                 context,
@@ -565,7 +600,7 @@ public class RemoteExecutionService {
               platform,
               context.getTimeout(),
               Spawns.mayBeCachedRemotely(spawn),
-              buildSalt(spawn, spawnScrubber));
+              buildSalt(spawn, spawnScrubber, prunableInputPathsDigest));
 
       ActionKey actionKey = digestUtil.computeActionKey(action);
 
@@ -763,6 +798,257 @@ public class RemoteExecutionService {
     public int hashCode() {
       return Objects.hash(actionResult, executeResponse);
     }
+  }
+
+  public record PrunedCacheHit(RemoteAction prunedAction, RemoteActionResult result) {}
+
+  private static final String PRUNED_INPUTS_MANIFEST_PATH = "pruned_inputs_manifest";
+
+  private static ImmutableSortedMap<String, ActionInput> indexPrunableInputs(Spawn spawn) {
+    PathMapper pathMapper = spawn.getPathMapper();
+    Map<String, ActionInput> byPath = new HashMap<>();
+    for (ActionInput input : spawn.getPrunableInputs().toList()) {
+      byPath.putIfAbsent(pathMapper.getMappedExecPathString(input), input);
+    }
+    return ImmutableSortedMap.copyOf(byPath);
+  }
+
+  private static NestedSet<ActionInput> inputsWithPrunableReplacedBy(
+      Spawn spawn, Collection<? extends ActionInput> used) {
+    ImmutableSet<ActionInput> prunable = ImmutableSet.copyOf(spawn.getPrunableInputs().toList());
+    ImmutableList.Builder<ActionInput> inputs = ImmutableList.builder();
+    for (ActionInput input : spawn.getInputFiles().toList()) {
+      if (!prunable.contains(input)) {
+        inputs.add(input);
+      }
+    }
+    inputs.addAll(used);
+    return NestedSetBuilder.wrap(Order.STABLE_ORDER, inputs.build());
+  }
+
+  private ByteString prunableInputPathsDigest(Collection<String> sortedPaths) {
+    Digest digest = digestUtil.compute(String.join("\0", sortedPaths).getBytes(UTF_8));
+    return ByteString.copyFromUtf8(digest.getHash());
+  }
+
+  private RemoteAction buildManifestAction(RemoteAction action, Collection<String> prunablePaths)
+      throws IOException, ExecException, InterruptedException {
+    return buildRemoteAction(
+        action.getSpawn(),
+        inputsWithPrunableReplacedBy(action.getSpawn(), ImmutableList.of()),
+        prunableInputPathsDigest(prunablePaths),
+        action.getSpawnExecutionContext(),
+        MerkleTreeComputer.BlobPolicy.DISCARD);
+  }
+
+  private RemoteAction buildPrunedAction(
+      RemoteAction action, Collection<? extends ActionInput> used)
+      throws IOException, ExecException, InterruptedException {
+    return buildRemoteAction(
+        action.getSpawn(),
+        inputsWithPrunableReplacedBy(action.getSpawn(), used),
+        /* prunableInputPathsDigest= */ null,
+        action.getSpawnExecutionContext(),
+        MerkleTreeComputer.BlobPolicy.DISCARD);
+  }
+
+  @Nullable
+  private PrunedInputsManifest downloadPrunedInputsManifest(RemoteAction manifestAction)
+      throws IOException, InterruptedException {
+    RemoteActionExecutionContext context = manifestAction.getRemoteActionExecutionContext();
+    try {
+      CachedActionResult cached =
+          combinedCache.downloadActionResult(
+              context,
+              manifestAction.getActionKey(),
+              /* inlineOutErr= */ false,
+              /* inlineOutputFiles= */ ImmutableSet.of());
+      if (cached == null || cached.actionResult().getOutputFilesCount() == 0) {
+        return null;
+      }
+      byte[] bytes =
+          getFromFuture(
+              combinedCache.downloadBlob(
+                  context, cached.actionResult().getOutputFiles(0).getDigest()));
+      return PrunedInputsManifest.parseFrom(bytes, ExtensionRegistry.getEmptyRegistry());
+    } catch (CacheNotFoundException | InvalidProtocolBufferException e) {
+      return null;
+    }
+  }
+
+  private void uploadPrunedInputsManifest(
+      RemoteAction manifestAction, PrunedInputsManifest manifest, boolean force)
+      throws IOException, InterruptedException {
+    RemoteActionExecutionContext context = manifestAction.getRemoteActionExecutionContext();
+    ByteString manifestBytes = manifest.toByteString();
+    Digest manifestDigest = digestUtil.compute(manifestBytes.toByteArray());
+    ByteString actionBytes = manifestAction.getAction().toByteString();
+    waitForBulkTransfer(
+        ImmutableList.of(
+            combinedCache.uploadBlob(context, manifestDigest, (Blob) manifestBytes::newInput, force),
+            combinedCache.uploadBlob(
+                context,
+                manifestAction.getActionKey().digest(),
+                (Blob) actionBytes::newInput,
+                force)));
+    ActionResult manifestResult =
+        ActionResult.newBuilder()
+            .setExitCode(0)
+            .addOutputFiles(
+                OutputFile.newBuilder()
+                    .setPath(PRUNED_INPUTS_MANIFEST_PATH)
+                    .setDigest(manifestDigest))
+            .build();
+    getFromFuture(
+        combinedCache.uploadActionResult(context, manifestAction.getActionKey(), manifestResult));
+  }
+
+  private PrunedInputsManifest withMostRecentCandidate(
+      PrunedInputsManifest manifest, PrunedInputsManifest.Candidate mostRecent) {
+    int maxCandidates = Math.max(1, remoteOptions.remoteCachePrunedInputsMaxCandidates);
+    PrunedInputsManifest.Builder builder = PrunedInputsManifest.newBuilder();
+    builder.addCandidates(mostRecent);
+    for (PrunedInputsManifest.Candidate candidate : manifest.getCandidatesList()) {
+      if (builder.getCandidatesCount() >= maxCandidates) {
+        break;
+      }
+      if (!candidate.getPrunedActionHash().equals(mostRecent.getPrunedActionHash())) {
+        builder.addCandidates(candidate);
+      }
+    }
+    return builder.build();
+  }
+
+  @Nullable
+  public PrunedCacheHit lookupPrunedCache(RemoteAction action)
+      throws IOException, ExecException, InterruptedException {
+    Spawn spawn = action.getSpawn();
+    if (!remoteOptions.remoteCachePrunedInputs
+        || spawn.getPrunableInputs().isEmpty()
+        || wasRewound.test(spawn.getResourceOwner())) {
+      return null;
+    }
+    ImmutableSortedMap<String, ActionInput> prunableByPath = indexPrunableInputs(spawn);
+    RemoteAction manifestAction = buildManifestAction(action, prunableByPath.keySet());
+    PrunedInputsManifest manifest = downloadPrunedInputsManifest(manifestAction);
+    if (manifest == null) {
+      return null;
+    }
+    for (int i = 0; i < manifest.getCandidatesCount(); i++) {
+      PrunedInputsManifest.Candidate candidate = manifest.getCandidates(i);
+      List<ActionInput> used = new ArrayList<>(candidate.getUsedPathsCount());
+      for (String path : candidate.getUsedPathsList()) {
+        ActionInput input = prunableByPath.get(path);
+        if (input == null) {
+          used = null;
+          break;
+        }
+        used.add(input);
+      }
+      if (used == null) {
+        continue;
+      }
+      RemoteAction prunedAction = buildPrunedAction(action, used);
+      Digest key = prunedAction.getActionKey().digest();
+      if (!key.getHash().equals(candidate.getPrunedActionHash())
+          || key.getSizeBytes() != candidate.getPrunedActionSizeBytes()) {
+        continue;
+      }
+      RemoteActionResult result = lookupCache(prunedAction);
+      if (result == null) {
+        continue;
+      }
+      if (i > 0
+          && manifestAction.getRemoteActionExecutionContext().getWriteCachePolicy().allowAnyCache()) {
+        try {
+          uploadPrunedInputsManifest(
+              manifestAction, withMostRecentCandidate(manifest, candidate), /* force= */ false);
+        } catch (IOException e) {
+          reportUploadError(e);
+        }
+      }
+      return new PrunedCacheHit(prunedAction, result);
+    }
+    return null;
+  }
+
+  private void maybeUploadPrunedOutputs(RemoteAction action, SpawnResult spawnResult, boolean force)
+      throws IOException, ExecException, InterruptedException {
+    recordPrunedInputs(action, spawnResult, /* executedResult= */ null, force);
+  }
+
+  public void recordPrunedInputsAfterRemoteExecution(
+      RemoteAction action, RemoteActionResult result, SpawnResult spawnResult)
+      throws InterruptedException {
+    if (!action.getRemoteActionExecutionContext().getWriteCachePolicy().allowAnyCache()) {
+      return;
+    }
+    try {
+      recordPrunedInputs(action, spawnResult, result.actionResult, /* force= */ false);
+    } catch (IOException | ExecException e) {
+      reportUploadError(e);
+    }
+  }
+
+  private void recordPrunedInputs(
+      RemoteAction action,
+      SpawnResult spawnResult,
+      @Nullable ActionResult executedResult,
+      boolean force)
+      throws IOException, ExecException, InterruptedException {
+    Spawn spawn = action.getSpawn();
+    if (!remoteOptions.remoteCachePrunedInputs
+        || spawn.getPrunableInputs().isEmpty()
+        || !(spawn.getResourceOwner() instanceof PrunesSpawnInputs pruner)) {
+      return;
+    }
+    ImmutableSet<ActionInput> used = pruner.usedPrunableInputs(spawn, spawnResult, execRoot);
+    if (used == null) {
+      return;
+    }
+    ImmutableSortedMap<String, ActionInput> prunableByPath = indexPrunableInputs(spawn);
+    PathMapper pathMapper = spawn.getPathMapper();
+    ImmutableList<String> usedPaths =
+        used.stream().map(pathMapper::getMappedExecPathString).sorted().collect(toImmutableList());
+    for (String path : usedPaths) {
+      if (!prunableByPath.containsKey(path)) {
+        return;
+      }
+    }
+
+    RemoteAction prunedAction = buildPrunedAction(action, used);
+    if (executedResult == null) {
+      UploadManifest prunedUpload = buildUploadManifest(prunedAction, spawnResult);
+      var unused =
+          prunedUpload.upload(
+              prunedAction.getRemoteActionExecutionContext(), combinedCache, reporter, force);
+    } else {
+      RemoteActionExecutionContext context = prunedAction.getRemoteActionExecutionContext();
+      ByteString actionBytes = prunedAction.getAction().toByteString();
+      ByteString commandBytes = prunedAction.getCommand().toByteString();
+      waitForBulkTransfer(
+          ImmutableList.of(
+              combinedCache.uploadBlob(
+                  context, prunedAction.getActionKey().digest(), (Blob) actionBytes::newInput, force),
+              combinedCache.uploadBlob(
+                  context, prunedAction.getCommandHash(), (Blob) commandBytes::newInput, force)));
+      getFromFuture(
+          combinedCache.uploadActionResult(context, prunedAction.getActionKey(), executedResult));
+    }
+
+    RemoteAction manifestAction = buildManifestAction(action, prunableByPath.keySet());
+    Digest prunedKey = prunedAction.getActionKey().digest();
+    PrunedInputsManifest.Candidate candidate =
+        PrunedInputsManifest.Candidate.newBuilder()
+            .addAllUsedPaths(usedPaths)
+            .setPrunedActionHash(prunedKey.getHash())
+            .setPrunedActionSizeBytes(prunedKey.getSizeBytes())
+            .build();
+    PrunedInputsManifest existing = downloadPrunedInputsManifest(manifestAction);
+    if (existing == null) {
+      existing = PrunedInputsManifest.getDefaultInstance();
+    }
+    uploadPrunedInputsManifest(manifestAction, withMostRecentCandidate(existing, candidate), force);
   }
 
   /** Lookup the remote cache for the given {@link RemoteAction}. {@code null} if not found. */
@@ -1898,6 +2184,7 @@ public class RemoteExecutionService {
       UploadManifest manifest = buildUploadManifest(action, spawnResult);
       var unused =
           manifest.upload(action.getRemoteActionExecutionContext(), combinedCache, reporter, force);
+      maybeUploadPrunedOutputs(action, spawnResult, force);
     } catch (IOException e) {
       reportUploadError(e);
     } finally {

@@ -110,6 +110,7 @@ java_library(
         "ParamFileInfo.java",
         "ParameterFile.java",
         "ProxyMetadataFactory.java",
+        "PrunesSpawnInputs.java",
         "ResourceEstimator.java",
         "RichDataProducingAction.java",
         "RunfilesTreeAction.java",

@@ -312,14 +312,40 @@ public final class MerkleTreeComputer {
       RemotePathResolver remotePathResolver,
       BlobPolicy blobPolicy)
       throws IOException, InterruptedException, LostInputsExecException {
+    return buildForSpawn(
+        spawn,
+        spawn.getInputFiles(),
+        toolInputs,
+        scrubber,
+        spawnExecutionContext,
+        remotePathResolver,
+        blobPolicy);
+  }
+
+  public MerkleTree buildForSpawn(
+      Spawn spawn,
+      NestedSet<? extends ActionInput> inputFiles,
+      Set<PathFragment> toolInputs,
+      @Nullable Scrubber scrubber,
+      SpawnExecutionContext spawnExecutionContext,
+      RemotePathResolver remotePathResolver,
+      BlobPolicy blobPolicy)
+      throws IOException, InterruptedException, LostInputsExecException {
     try (SilentCloseable c = Profiler.instance().profile("MerkleTreeComputer.buildForSpawn")) {
       return doBuildForSpawn(
-          spawn, toolInputs, scrubber, spawnExecutionContext, remotePathResolver, blobPolicy);
+          spawn,
+          inputFiles,
+          toolInputs,
+          scrubber,
+          spawnExecutionContext,
+          remotePathResolver,
+          blobPolicy);
     }
   }
 
   private MerkleTree doBuildForSpawn(
       Spawn spawn,
+      NestedSet<? extends ActionInput> inputFiles,
       Set<PathFragment> toolInputs,
       @Nullable Scrubber scrubber,
       SpawnExecutionContext spawnExecutionContext,
@@ -337,7 +363,7 @@ public final class MerkleTreeComputer {
         }
       }
     }
-    var spawnInputs = spawn.getInputFiles().toList();
+    var spawnInputs = inputFiles.toList();
     // Add output directories to inputs so that they are created as empty directories by the
     // executor. The spec only requires the executor to create the parent directory of an output
     // directory, which differs from the behavior of both local and sandboxed execution.

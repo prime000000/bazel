@@ -271,6 +271,21 @@ java_library_srcs(
 )
 
 proto_library(
+    name = "pruned_inputs_manifest_proto",
+    srcs = ["pruned_inputs_manifest.proto"],
+)
+
+java_proto_library(
+    name = "pruned_inputs_manifest_java_proto",
+    deps = [":pruned_inputs_manifest_proto"],
+)
+
+java_library_srcs(
+    name = "pruned_inputs_manifest_java_proto_srcs",
+    deps = [":pruned_inputs_manifest_java_proto"],
+)
+
+proto_library(
     name = "remote_scrubbing_proto",
     srcs = ["remote_scrubbing.proto"],
 )
@@ -440,6 +455,7 @@ filegroup(
         ":libcommand_server_java_grpc-src.jar",
         ":option_filters_java_proto_srcs",
         ":profile_java_proto_srcs",
+        ":pruned_inputs_manifest_java_proto_srcs",
         ":remote_execution_log_java_proto_srcs",
         ":remote_scrubbing_java_proto_srcs",
         ":spawn_java_proto_srcs",

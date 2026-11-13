@@ -55,6 +55,7 @@ import com.google.devtools.build.lib.exec.SpawnSchedulingEvent;
 import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.ProfilerTask;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
+import com.google.devtools.build.lib.remote.RemoteExecutionService.PrunedCacheHit;
 import com.google.devtools.build.lib.remote.RemoteExecutionService.RemoteActionResult;
 import com.google.devtools.build.lib.remote.RemoteExecutionService.ServerLogs;
 import com.google.devtools.build.lib.remote.circuitbreaker.CircuitBreakerFactory;
@@ -213,9 +214,22 @@ public class RemoteSpawnRunner implements SpawnRunner {
         cachedResult = acceptCachedResult ? remoteExecutionService.lookupCache(action) : null;
       }
 
+      RemoteAction cachedAction = action;
+      if (cachedResult == null && acceptCachedResult) {
+        PrunedCacheHit prunedHit;
+        try (SilentCloseable c =
+            prof.profile(ProfilerTask.REMOTE_CACHE_CHECK, "check pruned cache hit")) {
+          prunedHit = remoteExecutionService.lookupPrunedCache(action);
+        }
+        if (prunedHit != null) {
+          cachedAction = prunedHit.prunedAction();
+          cachedResult = prunedHit.result();
+        }
+      }
+
       if (cachedResult != null) {
         if (cachedResult.getExitCode() != 0
-            || cachedResult.maybeGetMissingMandatoryOutput(action).isPresent()) {
+            || cachedResult.maybeGetMissingMandatoryOutput(cachedAction).isPresent()) {
           // Failed actions are treated as a cache miss mostly in order to avoid caching flaky
           // actions (tests).
           // Set acceptCachedResult to false in order to force the action re-execution
@@ -223,7 +237,7 @@ public class RemoteSpawnRunner implements SpawnRunner {
         } else {
           try {
             return downloadAndFinalizeSpawnResult(
-                action,
+                cachedAction,
                 cachedResult,
                 /* cacheHit= */ true,
                 cachedResult.cacheName(),
@@ -331,15 +345,21 @@ public class RemoteSpawnRunner implements SpawnRunner {
             }
 
             try {
-              return downloadAndFinalizeSpawnResult(
-                  action,
-                  result,
-                  result.cacheHit(),
-                  getName(),
-                  spawn,
-                  totalTime,
-                  () -> action.getNetworkTime().getDuration(),
-                  spawnMetrics);
+              SpawnResult spawnResult =
+                  downloadAndFinalizeSpawnResult(
+                      action,
+                      result,
+                      result.cacheHit(),
+                      getName(),
+                      spawn,
+                      totalTime,
+                      () -> action.getNetworkTime().getDuration(),
+                      spawnMetrics);
+              if (!result.cacheHit() && result.success()) {
+                remoteExecutionService.recordPrunedInputsAfterRemoteExecution(
+                    action, result, spawnResult);
+              }
+              return spawnResult;
             } catch (BulkTransferException e) {
               if (e.allCausedByCacheNotFoundException()) {
                 // No cache hit, so if we retry this execution, we must no longer accept

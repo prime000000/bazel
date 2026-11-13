@@ -41,6 +41,7 @@ public final class SimpleSpawn implements Spawn {
   @Nullable private final Set<? extends ActionInput> mandatoryOutputs;
   private final PathMapper pathMapper;
   private final ResourceSetOrBuilder localResources;
+  private final NestedSet<? extends ActionInput> prunableInputs;
   @Nullable private ResourceSet localResourcesCached;
 
   @SuppressWarnings("TooManyParameters")
@@ -54,7 +55,8 @@ public final class SimpleSpawn implements Spawn {
       Collection<? extends ActionInput> outputs,
       @Nullable Set<? extends ActionInput> mandatoryOutputs,
       ResourceSetOrBuilder localResources,
-      PathMapper pathMapper) {
+      PathMapper pathMapper,
+      NestedSet<? extends ActionInput> prunableInputs) {
     this.owner = Preconditions.checkNotNull(owner);
     this.arguments = Preconditions.checkNotNull(arguments);
     this.environment = Preconditions.checkNotNull(environment);
@@ -66,6 +68,33 @@ public final class SimpleSpawn implements Spawn {
     this.localResources = Preconditions.checkNotNull(localResources);
     this.localResourcesCached = null;
     this.pathMapper = pathMapper;
+    this.prunableInputs = Preconditions.checkNotNull(prunableInputs);
+  }
+
+  @SuppressWarnings("TooManyParameters")
+  public SimpleSpawn(
+      ActionExecutionMetadata owner,
+      ImmutableList<String> arguments,
+      ImmutableMap<String, String> environment,
+      ImmutableMap<String, String> executionInfo,
+      NestedSet<? extends ActionInput> inputs,
+      NestedSet<? extends ActionInput> tools,
+      Collection<? extends ActionInput> outputs,
+      @Nullable Set<? extends ActionInput> mandatoryOutputs,
+      ResourceSetOrBuilder localResources,
+      PathMapper pathMapper) {
+    this(
+        owner,
+        arguments,
+        environment,
+        executionInfo,
+        inputs,
+        tools,
+        outputs,
+        mandatoryOutputs,
+        localResources,
+        pathMapper,
+        NestedSetBuilder.emptySet(Order.STABLE_ORDER));
   }
 
   public SimpleSpawn(
@@ -130,6 +159,11 @@ public final class SimpleSpawn implements Spawn {
   @Override
   public NestedSet<? extends ActionInput> getInputFiles() {
     return inputs;
+  }
+
+  @Override
+  public NestedSet<? extends ActionInput> getPrunableInputs() {
+    return prunableInputs;
   }
 
   @Override

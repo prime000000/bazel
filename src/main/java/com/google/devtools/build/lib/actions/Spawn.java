@@ -19,6 +19,8 @@ import com.google.common.collect.ImmutableMap;
 import com.google.devtools.build.lib.analysis.platform.PlatformInfo;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.collect.nestedset.NestedSet;
+import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
+import com.google.devtools.build.lib.collect.nestedset.Order;
 import com.google.devtools.build.lib.util.DescribableExecutionUnit;
 import java.util.Collection;
 import javax.annotation.Nullable;
@@ -189,5 +191,9 @@ public interface Spawn extends DescribableExecutionUnit {
    */
   default PathMapper getPathMapper() {
     return PathMapper.NOOP;
+  }
+
+  default NestedSet<? extends ActionInput> getPrunableInputs() {
+    return NestedSetBuilder.emptySet(Order.STABLE_ORDER);
   }
 }

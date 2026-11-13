@@ -15,6 +15,8 @@ package com.google.devtools.build.lib.remote;
 
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.extensions.proto.ProtoTruth.assertThat;
+import static com.google.common.util.concurrent.Futures.immediateFuture;
+import static com.google.common.util.concurrent.Futures.immediateVoidFuture;
 import static org.junit.Assert.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
@@ -33,6 +35,7 @@ import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import build.bazel.remote.execution.v2.ActionResult;
+import build.bazel.remote.execution.v2.CacheCapabilities;
 import build.bazel.remote.execution.v2.Digest;
 import build.bazel.remote.execution.v2.ExecuteOperationMetadata;
 import build.bazel.remote.execution.v2.ExecuteRequest;
@@ -67,6 +70,8 @@ import com.google.devtools.build.lib.actions.CommandLines.ParamFileActionInput;
 import com.google.devtools.build.lib.actions.ExecutionRequirements;
 import com.google.devtools.build.lib.actions.LostInputsExecException;
 import com.google.devtools.build.lib.actions.ParameterFile.ParameterFileType;
+import com.google.devtools.build.lib.actions.PathMapper;
+import com.google.devtools.build.lib.actions.PrunesSpawnInputs;
 import com.google.devtools.build.lib.actions.ResourceSet;
 import com.google.devtools.build.lib.actions.SimpleSpawn;
 import com.google.devtools.build.lib.actions.Spawn;
@@ -75,6 +80,7 @@ import com.google.devtools.build.lib.actions.SpawnResult;
 import com.google.devtools.build.lib.actions.SpawnResult.Status;
 import com.google.devtools.build.lib.actions.util.ActionsTestUtil;
 import com.google.devtools.build.lib.clock.JavaClock;
+import com.google.devtools.build.lib.collect.nestedset.NestedSet;
 import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
 import com.google.devtools.build.lib.collect.nestedset.Order;
 import com.google.devtools.build.lib.events.Reporter;
@@ -94,6 +100,7 @@ import com.google.devtools.build.lib.remote.common.CacheNotFoundException;
 import com.google.devtools.build.lib.remote.common.OperationObserver;
 import com.google.devtools.build.lib.remote.common.RemoteActionExecutionContext;
 import com.google.devtools.build.lib.remote.common.RemoteCacheClient.ActionKey;
+import com.google.devtools.build.lib.remote.common.RemoteCacheClient.Blob;
 import com.google.devtools.build.lib.remote.common.RemoteExecutionClient;
 import com.google.devtools.build.lib.remote.common.RemotePathResolver;
 import com.google.devtools.build.lib.remote.common.RemotePathResolver.SiblingRepositoryLayoutResolver;
@@ -126,7 +133,9 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
@@ -1945,5 +1954,130 @@ public class RemoteSpawnRunnerTest {
         logDir,
         service,
         digestUtil);
+  }
+
+  private static final class PruningOwner extends FakeOwner implements PrunesSpawnInputs {
+    private final ImmutableSet<ActionInput> used;
+
+    PruningOwner(ImmutableSet<ActionInput> used) {
+      super("foo", "bar", "//dummy:label");
+      this.used = used;
+    }
+
+    @Override
+    public ImmutableSet<ActionInput> usedPrunableInputs(
+        Spawn spawn, SpawnResult result, Path execRoot) {
+      return used;
+    }
+  }
+
+  private static SimpleSpawn prunableSpawn(
+      ImmutableList<ActionInput> prunable, ImmutableSet<ActionInput> used) {
+    NestedSet<ActionInput> prunableSet = NestedSetBuilder.wrap(Order.STABLE_ORDER, prunable);
+    return new SimpleSpawn(
+        new PruningOwner(used),
+        ImmutableList.of("/bin/cc", "src.cc"),
+        ImmutableMap.of(),
+        ImmutableMap.of(),
+        NestedSetBuilder.<ActionInput>stableOrder()
+            .add(ActionInputHelper.fromPath("src.cc"))
+            .addTransitive(prunableSet)
+            .build(),
+        /* tools= */ NestedSetBuilder.emptySet(Order.STABLE_ORDER),
+        /* outputs= */ ImmutableSet.of(ActionInputHelper.fromPath("out.o")),
+        /* mandatoryOutputs= */ null,
+        ResourceSet.ZERO,
+        PathMapper.NOOP,
+        prunableSet);
+  }
+
+  private Map<Digest, ActionResult> installInMemoryActionCache() throws Exception {
+    Map<Digest, ActionResult> actionResults = new HashMap<>();
+    Map<Digest, byte[]> blobs = new HashMap<>();
+    when(cache.getRemoteCacheCapabilities()).thenReturn(CacheCapabilities.getDefaultInstance());
+    when(cache.findMissingDigests(any(), any())).thenReturn(immediateFuture(ImmutableSet.of()));
+    when(cache.downloadActionResult(any(), any(), anyBoolean(), any()))
+        .thenAnswer(
+            invocation -> {
+              ActionKey key = invocation.getArgument(1);
+              ActionResult result = actionResults.get(key.digest());
+              return result == null ? null : CachedActionResult.remote(result);
+            });
+    when(cache.uploadActionResult(any(), any(), any()))
+        .thenAnswer(
+            invocation -> {
+              ActionKey key = invocation.getArgument(1);
+              actionResults.put(key.digest(), invocation.getArgument(2));
+              return immediateVoidFuture();
+            });
+    when(cache.uploadBlob(any(), any(), any(Blob.class), anyBoolean()))
+        .thenAnswer(
+            invocation -> {
+              Blob blob = invocation.getArgument(2);
+              blobs.put(invocation.getArgument(1), ByteStreams.toByteArray(blob.get()));
+              return immediateVoidFuture();
+            });
+    when(cache.downloadBlob(any(), any()))
+        .thenAnswer(invocation -> immediateFuture(blobs.get(invocation.getArgument(1))));
+    return actionResults;
+  }
+
+  @Test
+  public void prunedInputs_recordedAfterRemoteExecutionAndHitOnUnusedInputChange()
+      throws Exception {
+    remoteOptions.remoteAcceptCached = true;
+    remoteOptions.remoteUploadLocalResults = true;
+    remoteOptions.remoteCachePrunedInputs = true;
+    Map<Digest, ActionResult> actionResults = installInMemoryActionCache();
+    ActionInput a = ActionInputHelper.fromPath("a.h");
+    ActionInput b = ActionInputHelper.fromPath("b.h");
+    Spawn spawn = prunableSpawn(ImmutableList.of(a, b), ImmutableSet.of(a));
+    for (ActionInput input : spawn.getInputFiles().toList()) {
+      fakeFileCache.createScratchInput(input, input.getExecPathString());
+    }
+    ActionResult executed =
+        ActionResult.newBuilder()
+            .setExitCode(0)
+            .addOutputFiles(
+                OutputFile.newBuilder().setPath("out.o").setDigest(digestUtil.computeAsUtf8("o")))
+            .build();
+    when(executor.executeRemotely(any(), any(), any()))
+        .thenReturn(ExecuteResponse.newBuilder().setResult(executed).build());
+
+    SpawnResult first = newSpawnRunner().exec(spawn, getSpawnContext(spawn));
+    assertThat(first.isCacheHit()).isFalse();
+    assertThat(actionResults).hasSize(2);
+    verify(executor, times(1)).executeRemotely(any(), any(), any());
+
+    fakeFileCache.createScratchInput(b, "changed");
+    SpawnResult second = newSpawnRunner().exec(spawn, getSpawnContext(spawn));
+    assertThat(second.isCacheHit()).isTrue();
+    verify(executor, times(1)).executeRemotely(any(), any(), any());
+
+    fakeFileCache.createScratchInput(a, "changed");
+    SpawnResult third = newSpawnRunner().exec(spawn, getSpawnContext(spawn));
+    assertThat(third.isCacheHit()).isFalse();
+    verify(executor, times(2)).executeRemotely(any(), any(), any());
+  }
+
+  @Test
+  public void prunedInputs_notRecordedWhenDisabled() throws Exception {
+    remoteOptions.remoteAcceptCached = true;
+    remoteOptions.remoteUploadLocalResults = true;
+    Map<Digest, ActionResult> actionResults = installInMemoryActionCache();
+    ActionInput a = ActionInputHelper.fromPath("a.h");
+    Spawn spawn = prunableSpawn(ImmutableList.of(a), ImmutableSet.of(a));
+    for (ActionInput input : spawn.getInputFiles().toList()) {
+      fakeFileCache.createScratchInput(input, input.getExecPathString());
+    }
+    when(executor.executeRemotely(any(), any(), any()))
+        .thenReturn(
+            ExecuteResponse.newBuilder()
+                .setResult(ActionResult.newBuilder().setExitCode(0))
+                .build());
+
+    newSpawnRunner().exec(spawn, getSpawnContext(spawn));
+
+    assertThat(actionResults).isEmpty();
   }
 }

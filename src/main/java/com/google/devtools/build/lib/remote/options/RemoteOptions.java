@@ -678,6 +678,29 @@ public final class RemoteOptions extends CommonRemoteOptions {
   public boolean remoteDiscardMerkleTrees;
 
   @Option(
+      name = "experimental_remote_cache_pruned_inputs",
+      defaultValue = "false",
+      documentationCategory = OptionDocumentationCategory.REMOTE,
+      effectTags = {OptionEffectTag.UNKNOWN},
+      help =
+          "If set to true, spawns that discover which of their inputs were actually used after "
+              + "execution (such as C++ compiles with .d files) additionally record the used "
+              + "subset in the remote cache and look it up on a cache miss, so that changes to "
+              + "unused inputs do not cause cache misses on machines without a local action cache.")
+  public boolean remoteCachePrunedInputs;
+
+  @Option(
+      name = "experimental_remote_cache_pruned_inputs_max_candidates",
+      defaultValue = "8",
+      documentationCategory = OptionDocumentationCategory.REMOTE,
+      effectTags = {OptionEffectTag.UNKNOWN},
+      help =
+          "The maximum number of previously used input subsets remembered per spawn in the remote "
+              + "cache when --experimental_remote_cache_pruned_inputs is enabled. The least "
+              + "recently used subset is evicted when the limit is exceeded.")
+  public int remoteCachePrunedInputsMaxCandidates;
+
+  @Option(
       name = "experimental_circuit_breaker_strategy",
       documentationCategory = OptionDocumentationCategory.REMOTE,
       defaultValue = "null",
